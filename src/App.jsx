@@ -5,7 +5,7 @@ import {
 } from "recharts";
 import {
   LayoutDashboard, Calendar as CalendarIcon, Plus, X, Trash2, Pencil,
-  ChevronLeft, ChevronRight, Repeat, Clock, AlertTriangle, CheckCircle2,
+  ChevronLeft, ChevronRight, Repeat, Clock, AlertTriangle, CheckCircle2, Sun,
 } from "lucide-react";
 import { ref as dbRef, onValue, set as dbSet, remove as dbRemove, get as dbGet } from "firebase/database";
 import { db } from "./firebase.js";
@@ -32,7 +32,7 @@ const COLORS = {
   infoBg: "#E6EFF6",
 };
 
-const APP_VERSION = "1.0.0";
+const APP_VERSION = "1.1.0";
 
 const BUCKETS = ["Kickoff", "Daily", "Weekly", "Monthly", "Quarterly"];
 const STATUSES = ["Not Started", "In Progress", "Done", "Blocked"];
@@ -55,13 +55,42 @@ const BUCKET_DEFAULT_INTERVAL = { Kickoff: null, Daily: "daily", Weekly: "weekly
 // ---------------------------------------------------------------------------
 // Date helpers
 // ---------------------------------------------------------------------------
-function addInterval(date, interval) {
+function addInterval(date, interval, sign = 1) {
   const d = new Date(date);
-  if (interval === "daily") d.setDate(d.getDate() + 1);
-  else if (interval === "weekly") d.setDate(d.getDate() + 7);
-  else if (interval === "monthly") d.setMonth(d.getMonth() + 1);
-  else if (interval === "quarterly") d.setMonth(d.getMonth() + 3);
+  if (interval === "daily") d.setDate(d.getDate() + 1 * sign);
+  else if (interval === "weekly") d.setDate(d.getDate() + 7 * sign);
+  else if (interval === "monthly") d.setMonth(d.getMonth() + 1 * sign);
+  else if (interval === "quarterly") d.setMonth(d.getMonth() + 3 * sign);
   return d.getTime();
+}
+// All occurrences a Weekly/Monthly/Quarterly recurring task would land on
+// within a given month, based on its stable anchorDate (day-of-week for
+// weekly, day-of-month for monthly/quarterly). Daily and Kickoff are
+// excluded — "due every day" adds no information as a calendar dot, and
+// Kickoff is one-time already.
+function occurrencesInMonth(task, year, month) {
+  if (!task.recurring || !task.interval || task.bucket === "Daily" || task.bucket === "Kickoff") return [];
+  const anchor = new Date(task.anchorDate || task.dueDate);
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const out = [];
+  if (task.interval === "weekly") {
+    const dow = anchor.getDay();
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dt = new Date(year, month, d);
+      if (dt.getDay() === dow) out.push(dt.getTime());
+    }
+  } else if (task.interval === "monthly") {
+    const dom = Math.min(anchor.getDate(), daysInMonth);
+    out.push(new Date(year, month, dom).getTime());
+  } else if (task.interval === "quarterly") {
+    const anchorMonthIdx = anchor.getFullYear() * 12 + anchor.getMonth();
+    const thisMonthIdx = year * 12 + month;
+    if (((thisMonthIdx - anchorMonthIdx) % 3 + 3) % 3 === 0) {
+      const dom = Math.min(anchor.getDate(), daysInMonth);
+      out.push(new Date(year, month, dom).getTime());
+    }
+  }
+  return out;
 }
 function fmtDate(ts) {
   if (!ts) return "—";
@@ -105,6 +134,37 @@ function getMonthGrid(year, month) {
 // ---------------------------------------------------------------------------
 function seedTasks() {
   const now = Date.now();
+
+  // --- Cadence anchor helpers: find the next real occurrence of a weekday,
+  // a day-of-month, or a quarter-start month, from today. These become the
+  // permanent `anchorDate` for each recurring task, driving both its first
+  // due date and its calendar projection pattern going forward.
+  function nextWeekday(targetDow) {
+    const d = new Date(startOfDay(now));
+    const diff = (targetDow - d.getDay() + 7) % 7;
+    d.setDate(d.getDate() + diff);
+    return d.getTime();
+  }
+  function nextDayOfMonth(targetDom) {
+    const d = new Date(startOfDay(now));
+    let candidate = new Date(d.getFullYear(), d.getMonth(), targetDom);
+    if (candidate.getTime() < d.getTime()) candidate = new Date(d.getFullYear(), d.getMonth() + 1, targetDom);
+    return candidate.getTime();
+  }
+  // Program quarters run Feb/May/Aug/Nov (the award's Feb 2 effective date).
+  function nextQuarterDay(offsetDay) {
+    const quarterMonths = [1, 4, 7, 10]; // 0-indexed: Feb, May, Aug, Nov
+    const d = new Date(startOfDay(now));
+    let best = null;
+    for (let yearOffset = 0; yearOffset <= 1; yearOffset++) {
+      for (const m of quarterMonths) {
+        const candidate = new Date(d.getFullYear() + yearOffset, m, offsetDay);
+        if (candidate.getTime() >= d.getTime() && (!best || candidate.getTime() < best.getTime())) best = candidate;
+      }
+    }
+    return best.getTime();
+  }
+
   const kickoff = [
     ["Kickoff meeting with MIA and all 3 subrecipients held", "Grant Program Manager", "2026-02-13"],
     ["Subaward agreements drafted for all 3 subrecipients", "Grant Program Manager", "2026-03-06"],
@@ -120,51 +180,59 @@ function seedTasks() {
     ["Subrecipient identity/selection question raised with MIA", "Grant Program Manager", "2026-02-13"],
     ["Company sourcing/lead-generation ownership confirmed with MIA", "Grant Program Manager", "2026-02-13"],
   ];
+  // Daily: anchored to today — "due every day" is trivial by definition, so
+  // these don't get calendar-projected (see occurrencesInMonth).
   const daily = [
     ["Check Dashboard for status/pipeline movement", "Grant Program Manager"],
     ["Review new applications received", "Grant Program Manager"],
     ["Monitor vetting committee / subrecipient correspondence", "Grant Program Manager"],
     ["Log service delivery updates from subrecipients", "Data / CRM Analyst"],
   ];
+  // Weekly: spread across the work week, Monday through Friday, so they
+  // don't all land on one day.
   const weekly = [
-    ["Vetting committee meeting prep (if scheduled this week)", "Grant Program Manager"],
-    ["Update Metrics & Pipeline Tracker with this week's counts", "Data / CRM Analyst"],
-    ["Check Subaward & Disbursement Tracker deadlines", "Grants Accountant"],
-    ["Check in with each subrecipient on service delivery pace", "Grant Program Manager"],
-    ["Scan for new/changed risks", "Grant Program Manager"],
+    ["Vetting committee meeting prep (if scheduled this week)", "Grant Program Manager", 1], // Mon
+    ["Update Metrics & Pipeline Tracker with this week's counts", "Data / CRM Analyst", 2], // Tue
+    ["Check Subaward & Disbursement Tracker deadlines", "Grants Accountant", 3], // Wed
+    ["Check in with each subrecipient on service delivery pace", "Grant Program Manager", 4], // Thu
+    ["Scan for new/changed risks", "Grant Program Manager", 5], // Fri
   ];
+  // Monthly: spread across specific days of the month in a sensible
+  // workflow order (close out last month's numbers first, then plan ahead).
   const monthly = [
-    ["Reconcile expenditure vs. 75% tranche threshold", "Grants Accountant"],
-    ["Update Budget Actuals tab", "Grants Accountant"],
-    ["Hold monthly vetting committee meeting", "Vetting Committee"],
-    ["Roll up Metrics & Pipeline Tracker monthly totals", "Data / CRM Analyst"],
-    ["Review company routing balance across the 3 subrecipients", "Grant Program Manager"],
-    ["Check upcoming reporting deadline prep window", "Grant Program Manager"],
+    ["Reconcile expenditure vs. 75% tranche threshold", "Grants Accountant", 1],
+    ["Update Budget Actuals tab", "Grants Accountant", 3],
+    ["Hold monthly vetting committee meeting", "Vetting Committee", 5],
+    ["Roll up Metrics & Pipeline Tracker monthly totals", "Data / CRM Analyst", 7],
+    ["Review company routing balance across the 3 subrecipients", "Grant Program Manager", 10],
+    ["Check upcoming reporting deadline prep window", "Grant Program Manager", 12],
   ];
+  // Quarterly: anchored to the program's own quarter cadence (Feb/May/Aug/Nov,
+  // matching the Feb 2 effective date), spread across the first week.
   const quarterly = [
-    ["Full budget category review (A-I) vs. actuals", "Grants Accountant"],
-    ["Subrecipient relationship / capacity check-in", "Grant Program Manager"],
-    ["Full Risk Register review and rescoring", "Grant Program Manager"],
-    ["Review Assumptions / Flagged Gaps / Open Questions", "Grant Program Manager"],
+    ["Full budget category review (A-I) vs. actuals", "Grants Accountant", 1],
+    ["Subrecipient relationship / capacity check-in", "Grant Program Manager", 3],
+    ["Full Risk Register review and rescoring", "Grant Program Manager", 5],
+    ["Review Assumptions / Flagged Gaps / Open Questions", "Grant Program Manager", 7],
   ];
 
   const tasks = {};
   let n = 0;
-  const push = (title, owner, bucket, dueDate, recurring) => {
+  const push = (title, owner, bucket, dueDate, recurring, anchorDate) => {
     n += 1;
     const id = `t${n}`;
     tasks[id] = {
       id, title, owner, bucket, status: "Not Started",
-      dueDate, recurring, interval: recurring ? BUCKET_DEFAULT_INTERVAL[bucket] : null,
+      dueDate, anchorDate: anchorDate ?? dueDate, recurring, interval: recurring ? BUCKET_DEFAULT_INTERVAL[bucket] : null,
       notes: "", completedCount: 0, lastCompletedAt: null, createdAt: now,
     };
   };
 
-  kickoff.forEach(([title, owner, date]) => push(title, owner, "Kickoff", new Date(date).getTime(), false));
-  daily.forEach(([title, owner], i) => push(title, owner, "Daily", startOfDay(now) + i * 3600000, true));
-  weekly.forEach(([title, owner], i) => push(title, owner, "Weekly", startOfDay(now + (i + 1) * 86400000), true));
-  monthly.forEach(([title, owner], i) => push(title, owner, "Monthly", startOfDay(now + (i + 2) * 86400000 * 3), true));
-  quarterly.forEach(([title, owner], i) => push(title, owner, "Quarterly", startOfDay(now + (i + 1) * 86400000 * 7), true));
+  kickoff.forEach(([title, owner, date]) => push(title, owner, "Kickoff", new Date(date + "T00:00:00").getTime(), false));
+  daily.forEach(([title, owner]) => push(title, owner, "Daily", startOfDay(now), true));
+  weekly.forEach(([title, owner, dow]) => { const d = nextWeekday(dow); push(title, owner, "Weekly", d, true, d); });
+  monthly.forEach(([title, owner, dom]) => { const d = nextDayOfMonth(dom); push(title, owner, "Monthly", d, true, d); });
+  quarterly.forEach(([title, owner, offset]) => { const d = nextQuarterDay(offset); push(title, owner, "Quarterly", d, true, d); });
 
   return tasks;
 }
@@ -366,6 +434,65 @@ function TaskModal({ initial, onSave, onClose }) {
 // ---------------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// My Day — the default landing view: overdue, due today, coming up
+// ---------------------------------------------------------------------------
+function MyDayView({ tasks, onCycleStatus, onEdit, onDelete }) {
+  const list = Object.values(tasks).filter((t) => t.status !== "Done" || isSameDay(t.dueDate, Date.now()));
+  const today = startOfDay(Date.now());
+  const in4Days = today + 4 * 86400000;
+
+  const overdue = list.filter((t) => isOverdue(t)).sort((a, b) => a.dueDate - b.dueDate);
+  const dueToday = list.filter((t) => t.dueDate && isSameDay(t.dueDate, today) && !isOverdue(t));
+  const comingUp = list.filter((t) => t.dueDate && t.dueDate > today && t.dueDate <= in4Days)
+    .sort((a, b) => a.dueDate - b.dueDate);
+
+  return (
+    <div style={{ padding: 28, maxWidth: 1000, margin: "0 auto" }}>
+      <h2 style={{ fontFamily: "Poppins, sans-serif", fontWeight: 700, fontSize: 22, color: COLORS.ink, marginBottom: 2 }}>
+        My Day
+      </h2>
+      <p style={{ fontFamily: "Inter, sans-serif", fontSize: 13, color: COLORS.slateLight, marginBottom: 24 }}>
+        {new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}
+      </p>
+
+      <DaySection title="Overdue" icon={AlertTriangle} color={COLORS.bad} tasks={overdue}
+        onCycleStatus={onCycleStatus} onEdit={onEdit} onDelete={onDelete}
+        empty="Nothing overdue." />
+
+      <DaySection title="Due today" icon={Clock} color={COLORS.warn} tasks={dueToday}
+        onCycleStatus={onCycleStatus} onEdit={onEdit} onDelete={onDelete}
+        empty="Nothing due today." />
+
+      <DaySection title="Coming up (next 4 days)" icon={CalendarIcon} color={COLORS.info} tasks={comingUp}
+        onCycleStatus={onCycleStatus} onEdit={onEdit} onDelete={onDelete}
+        empty="Nothing on deck for the next few days." />
+    </div>
+  );
+}
+
+function DaySection({ title, icon: Icon, color, tasks, onCycleStatus, onEdit, onDelete, empty }) {
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+        <Icon size={16} color={color} />
+        <h3 style={{ fontFamily: "Poppins, sans-serif", fontWeight: 700, fontSize: 15, color: COLORS.ink, margin: 0 }}>{title}</h3>
+        <span style={{
+          fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, fontWeight: 700, color,
+          background: `${color}18`, padding: "2px 8px", borderRadius: 999,
+        }}>{tasks.length}</span>
+      </div>
+      {tasks.length === 0 ? (
+        <div style={{ fontFamily: "Inter, sans-serif", fontSize: 13, color: COLORS.slateLight, paddingLeft: 24 }}>{empty}</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 12 }}>
+          {tasks.map((t) => <TaskCard key={t.id} task={t} onCycleStatus={onCycleStatus} onEdit={onEdit} onDelete={onDelete} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DashboardView({ tasks }) {
   const list = Object.values(tasks);
   const overdue = list.filter(isOverdue);
@@ -461,6 +588,21 @@ function CalendarView({ tasks, onEdit }) {
   const tasksForDay = (dayTs) => list.filter((t) => t.dueDate && isSameDay(t.dueDate, dayTs));
   const selectedTasks = tasksForDay(selectedDay);
 
+  // Projected occurrences (Weekly/Monthly/Quarterly cadence pattern) for the
+  // visible month — shown as lighter dots so the calendar reflects the real
+  // recurrence pattern, not just each task's single next due date.
+  const projectedByDay = useMemo(() => {
+    const map = {};
+    list.forEach((t) => {
+      occurrencesInMonth(t, year, month).forEach((ts) => {
+        const key = startOfDay(ts);
+        map[key] = map[key] || [];
+        map[key].push(t);
+      });
+    });
+    return map;
+  }, [tasks, year, month]);
+
   const goPrev = () => { const d = new Date(year, month - 1, 1); setYear(d.getFullYear()); setMonth(d.getMonth()); };
   const goNext = () => { const d = new Date(year, month + 1, 1); setYear(d.getFullYear()); setMonth(d.getMonth()); };
 
@@ -488,6 +630,8 @@ function CalendarView({ tasks, onEdit }) {
               {week.map((dayTs, di) => {
                 if (!dayTs) return <div key={di} />;
                 const dayTasks = tasksForDay(dayTs);
+                const projectedIds = new Set(dayTasks.map((t) => t.id));
+                const projectedOnly = (projectedByDay[dayTs] || []).filter((t) => !projectedIds.has(t.id));
                 const isToday = isSameDay(dayTs, Date.now());
                 const isSelected = isSameDay(dayTs, selectedDay);
                 return (
@@ -502,6 +646,9 @@ function CalendarView({ tasks, onEdit }) {
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 2, marginTop: 4 }}>
                       {dayTasks.slice(0, 4).map((t) => (
                         <span key={t.id} style={{ width: 6, height: 6, borderRadius: "50%", background: STATUS_META[t.status].color }} />
+                      ))}
+                      {projectedOnly.slice(0, 4).map((t) => (
+                        <span key={t.id} title={`${t.title} (recurs this day)`} style={{ width: 6, height: 6, borderRadius: "50%", background: COLORS.slateLight, opacity: 0.45 }} />
                       ))}
                     </div>
                   </button>
@@ -569,7 +716,7 @@ function BucketView({ bucket, tasks, onCycleStatus, onEdit, onDelete }) {
 export default function App() {
   const [tasks, setTasks] = useState({});
   const [syncStatus, setSyncStatus] = useState("connecting");
-  const [view, setView] = useState("dashboard");
+  const [view, setView] = useState("myday");
   const [modalTask, setModalTask] = useState(undefined); // undefined = closed, null = new, obj = edit
 
   useEffect(() => {
@@ -588,7 +735,7 @@ export default function App() {
 
   const saveTask = (form) => {
     const id = form.id || `t${Date.now()}`;
-    const record = { ...form, id };
+    const record = { ...form, id, anchorDate: form.anchorDate ?? form.dueDate };
     setTasks((prev) => ({ ...prev, [id]: record }));
     dbSet(dbRef(db, `tasks/${id}`), record);
     setModalTask(undefined);
@@ -620,6 +767,7 @@ export default function App() {
   };
 
   const NAV = [
+    { key: "myday", label: "My Day", icon: Sun },
     { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
     { key: "calendar", label: "Calendar", icon: CalendarIcon },
     ...BUCKETS.map((b) => ({ key: `bucket:${b}`, label: b, icon: null })),
@@ -674,6 +822,7 @@ export default function App() {
         </div>
       </div>
 
+      {view === "myday" && <MyDayView tasks={tasks} onCycleStatus={cycleStatus} onEdit={setModalTask} onDelete={deleteTask} />}
       {view === "dashboard" && <DashboardView tasks={tasks} />}
       {view === "calendar" && <CalendarView tasks={tasks} onEdit={setModalTask} />}
       {BUCKETS.map((b) => view === `bucket:${b}` && (
